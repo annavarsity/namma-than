@@ -1,19 +1,35 @@
 import cv2
 import sys
 import os
+import time
 
-def play_half_video(video_path, side="left"):
-    # Load the video
+# Try to import the audio player, but don't crash if it's missing 
+# (unless the user specifically asks to play audio on this machine).
+try:
+    from ffpyplayer.player import MediaPlayer
+    FFPYPLAYER_AVAILABLE = True
+except ImportError:
+    FFPYPLAYER_AVAILABLE = False
+
+
+def play_half_video(video_path, side="left", play_audio=False):
+    # Load the video frames
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video at {video_path}")
         return
 
-    # Get video FPS to play at normal speed
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    delay = int(1000 / fps) if fps > 0 else 30
+    # Load the audio track if requested
+    player = None
+    if play_audio:
+        print("Loading audio track...")
+        player = MediaPlayer(video_path)
 
-    # Read the first frame to get original dimensions
+    # Get video FPS to keep the loop timed correctly
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_delay = int(1000 / fps) if fps > 0 else 30
+
+    # Read the first frame to calculate crops
     ret, frame = cap.read()
     if not ret:
         print("Error: Could not read video frames.")
@@ -22,12 +38,11 @@ def play_half_video(video_path, side="left"):
     orig_h, orig_w = frame.shape[:2]
 
     # 1. Calculate the 32:9 crop dimensions
-    # To convert 16:9 to 32:9, we keep the width and shrink the height
     target_h = int(orig_w * (9 / 32))
     y_start = (orig_h - target_h) // 2
     y_end = y_start + target_h
 
-    # 2. Calculate the split down the middle
+    # 2. Calculate the split
     half_w = orig_w // 2
 
     # Setup the fullscreen window
@@ -35,43 +50,49 @@ def play_half_video(video_path, side="left"):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"Playing {side} half... Press 'q' to quit.")
+    print(f"\n>>> Playing {side.upper()} half. Press 'q' to quit at any time. <<<")
 
     while True:
         if not ret:
-            # Loop the video or break. Here we just end it.
             break
 
         # Crop out the center 32:9 strip
         cropped_32_9 = frame[y_start:y_end, 0:orig_w]
 
-        # Split the strip into the Left or Right half
+        # Split into Left or Right half
         if side == "left":
             display_frame = cropped_32_9[:, 0:half_w]
         else:
             display_frame = cropped_32_9[:, half_w:orig_w]
 
-        # Show the frame
+        # Show the video frame
         cv2.imshow(window_name, display_frame)
 
+        # Let the audio player process its frames in the background
+        if play_audio and player is not None:
+            audio_frame, val = player.get_frame()
+            if val == 'eof': # End of file
+                break
+
         # Wait for the correct frame delay, exit if 'q' is pressed
-        if cv2.waitKey(delay) & 0xFF == ord('q'):
+        if cv2.waitKey(frame_delay) & 0xFF == ord('q'):
             break
 
-        # Read the next frame
+        # Read the next video frame
         ret, frame = cap.read()
 
-    # Cleanup
+    # Cleanup everything when done
     cap.release()
     cv2.destroyAllWindows()
+    if player is not None:
+        player.close_player()
+
 
 if __name__ == "__main__":
-    print("=== 32:9 Ultrawide Dual-Laptop Player ===")
+    print("=== 32:9 Ultrawide Dual-Laptop Player (With Audio) ===")
     
-    # Get the video path
-    video_file = input("Enter the path to the video file (e.g., video.mp4): ").strip()
-    
-    # Remove quotes if the user dragged and dropped the file into the terminal
+    # 1. Get Video File
+    video_file = input("Enter the path to the video file: ").strip()
     if video_file.startswith('"') and video_file.endswith('"'):
         video_file = video_file[1:-1]
 
@@ -79,10 +100,21 @@ if __name__ == "__main__":
         print("Error: That file does not exist.")
         sys.exit(1)
 
-    # Ask the user which side this laptop is
-    choice = input("Which screen is this laptop? (left / right): ").strip().lower()
+    # 2. Get Screen Side
+    side_choice = input("Which screen is this laptop? (left / right): ").strip().lower()
+    if side_choice not in ["left", "right"]:
+        print("Invalid choice. Please run again and type 'left' or 'right'.")
+        sys.exit(1)
 
-    if choice in ["left", "right"]:
-        play_half_video(video_file, choice)
-    else:
-        print("Invalid choice. Please run the script again and type 'left' or 'right'.")
+    # 3. Audio Setup
+    audio_choice = input("Should THIS laptop play the audio? (yes / no): ").strip().lower()
+    play_audio = (audio_choice == "yes" or audio_choice == "y")
+
+    # Safety check: if they want audio but didn't install the library
+    if play_audio and not FFPYPLAYER_AVAILABLE:
+        print("\n[!] ERROR: You requested audio, but 'ffpyplayer' is not installed.")
+        print("Please open your terminal and run: pip install ffpyplayer")
+        sys.exit(1)
+
+    # Start the magic
+    play_half_video(video_file, side_choice, play_audio)
