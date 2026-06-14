@@ -1,0 +1,188 @@
+import tkinter as tk
+from tkinter import ttk, filedialog
+import vlc
+import socket
+import threading
+import json
+import time
+import sys
+
+# --- Configuration ---
+UDP_PORT = 50000
+TCP_PORT = 50001
+MAGIC_WORD = "SYNC_PLAYER_HELLO"
+
+class SyncPlayerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Distributed P2P Sync Player")
+        self.root.geometry("800x600")
+
+        self.is_host = False
+        self.tcp_conn = None
+
+        # Initialize VLC
+        self.vlc_instance = vlc.Instance()
+        self.player = self.vlc_instance.media_player_new()
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Top Frame: Network Controls
+        self.control_frame = ttk.Frame(self.root)
+        self.control_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+
+        ttk.Button(self.control_frame, text="Host Session", command=self.start_host).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.control_frame, text="Join Session", command=self.start_client).pack(side=tk.LEFT, padx=5)
+
+        self.status_var = tk.StringVar(value="Status: Waiting...")
+        ttk.Label(self.control_frame, textvariable=self.status_var).pack(side=tk.LEFT, padx=20)
+
+        # Middle Frame: Video Canvas
+        self.video_frame = tk.Frame(self.root, bg="black")
+        self.video_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Bottom Frame: Playback Controls
+        self.play_frame = ttk.Frame(self.root)
+        self.play_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+
+        ttk.Button(self.play_frame, text="Load Video", command=self.load_video).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.play_frame, text="Play", command=self.play_video).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.play_frame, text="Pause", command=self.pause_video).pack(side=tk.LEFT, padx=5)
+
+        # Cross-platform VLC window attachment
+        self.root.update()
+        if sys.platform.startswith('linux'):
+            self.player.set_xwindow(self.video_frame.winfo_id())
+        elif sys.platform == "win32":
+            self.player.set_hwnd(self.video_frame.winfo_id())
+        elif sys.platform == "darwin":
+            self.player.set_nsobject(self.video_frame.winfo_id())
+
+    # --- Video Playback Logic ---
+    def load_video(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            media = self.vlc_instance.media_new(file_path)
+            self.player.set_media(media)
+            self.status_var.set(f"Loaded: {file_path.split('/')[-1]}")
+
+    def play_video(self):
+        self.player.play()
+        if self.is_host and self.tcp_conn:
+            self.send_sync_command("play", self.player.get_time())
+
+    def pause_video(self):
+        self.player.pause()
+        if self.is_host and self.tcp_conn:
+            self.send_sync_command("pause", self.player.get_time())
+
+    # --- Network Logic: Host ---
+    def start_host(self):
+        self.is_host = True
+        self.status_var.set("Hosting... Broadcasting discovery signal.")
+
+        # Start TCP Server to listen for the client
+        threading.Thread(target=self.tcp_server_thread, daemon=True).start()
+        # Start UDP Broadcast to announce presence
+        threading.Thread(target=self.udp_broadcast_thread, daemon=True).start()
+
+    def udp_broadcast_thread(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        payload = json.dumps({"magic": MAGIC_WORD, "port": TCP_PORT}).encode('utf-8')
+
+        while self.tcp_conn is None: # Broadcast until someone connects
+            sock.sendto(payload, ('<broadcast>', UDP_PORT))
+            time.sleep(1)
+        sock.close()
+
+    def tcp_server_thread(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('0.0.0.0', TCP_PORT))
+        server.listen(1)
+        conn, addr = server.accept()
+        self.tcp_conn = conn
+        self.status_var.set(f"Connected to Client: {addr[0]}")
+        self.listen_for_commands()
+
+    # --- Network Logic: Client ---
+    def start_client(self):
+        self.is_host = False
+        self.status_var.set("Searching for Host...")
+        threading.Thread(target=self.udp_listen_thread, daemon=True).start()
+
+    def udp_listen_thread(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('0.0.0.0', UDP_PORT))
+
+        while True:
+            data, addr = sock.recvfrom(1024)
+            try:
+                msg = json.loads(data.decode('utf-8'))
+                if msg.get("magic") == MAGIC_WORD:
+                    self.status_var.set(f"Found Host at {addr[0]}. Connecting...")
+                    self.connect_tcp(addr[0], msg["port"])
+                    break
+            except:
+                pass
+
+    def connect_tcp(self, host_ip, port):
+        self.tcp_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_conn.connect((host_ip, port))
+        self.status_var.set(f"Connected to Host: {host_ip}")
+        threading.Thread(target=self.listen_for_commands, daemon=True).start()
+
+    # --- Synchronization Protocol ---
+    def send_sync_command(self, command, video_timestamp):
+        if not self.tcp_conn: return
+
+        # Calculate execution time in the near future (200ms latency buffer)
+        execute_at = time.time() + 0.200
+
+        payload = {
+            "command": command,
+            "timestamp": video_timestamp,
+            "execute_at": execute_at
+        }
+        try:
+            self.tcp_conn.sendall((json.dumps(payload) + "\n").encode('utf-8'))
+        except Exception as e:
+            print("Send error:", e)
+
+    def listen_for_commands(self):
+        buffer = ""
+        while True:
+            try:
+                data = self.tcp_conn.recv(1024).decode('utf-8')
+                if not data: break
+                buffer += data
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    payload = json.loads(line)
+                    self.process_sync_payload(payload)
+            except Exception as e:
+                print("Receive error:", e)
+                break
+
+    def process_sync_payload(self, payload):
+        command = payload.get("command")
+        timestamp = payload.get("timestamp", 0)
+        execute_at = payload.get("execute_at", time.time())
+
+        # Spin-lock until the exact execution time arrives (Latency compensation)
+        while time.time() < execute_at:
+            pass
+
+        if command == "play":
+            self.player.set_time(timestamp)
+            self.player.play()
+        elif command == "pause":
+            self.player.set_time(timestamp)
+            self.player.pause()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SyncPlayerApp(root)
+    root.mainloop()
