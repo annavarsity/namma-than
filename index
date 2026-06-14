@@ -6,6 +6,7 @@ import socket
 import threading
 import random
 import tkinter as tk
+import numpy as np
 from tkinter import filedialog, messagebox
 
 # Audio player setup
@@ -15,38 +16,42 @@ try:
 except ImportError:
     FFPYPLAYER_AVAILABLE = False
 
-# --- GLOBAL STATE FOR SYNC ---
+# --- GLOBAL STATE ---
 sync_state = {
     "playing": False,
+    "connected": False,
     "current_frame": 0,
     "exit": False,
     "command_queue": []
 }
+
+mouse_pos = {"x": 0, "y": 0}
+global_pin = "0000"
 
 # --- NETWORK CONFIG ---
 UDP_PORT = 54321
 TCP_PORT = 54322
 
 def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # More robust way to get the actual local network IP
     try:
-        s.connect(('10.255.255.255', 1))
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
         ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
         s.close()
-    return ip
+        return ip
+    except Exception:
+        return '127.0.0.1'
 
-# --- HOST (SERVER) LOGIC ---
+# --- HOST LOGIC ---
 def host_network_thread(pin):
     host_ip = get_local_ip()
-    
+
     # 1. Listen for UDP broadcast from Client
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.bind(('', UDP_PORT))
+    udp_sock.bind(('0.0.0.0', UDP_PORT))
     print(f"[Network] Hosting on {host_ip}. Waiting for client with PIN: {pin}...")
-    
+
     client_ip = None
     while not sync_state["exit"]:
         udp_sock.settimeout(1.0)
@@ -62,26 +67,24 @@ def host_network_thread(pin):
             continue
 
     udp_sock.close()
-    
-    if sync_state["exit"] or not client_ip:
-        return
+    if sync_state["exit"] or not client_ip: return
 
     # 2. Setup TCP Server to send commands
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_sock.bind(('', TCP_PORT))
+    tcp_sock.bind(('0.0.0.0', TCP_PORT))
     tcp_sock.listen(1)
-    print("[Network] Waiting for TCP connection from client...")
     conn, addr = tcp_sock.accept()
+    
+    sync_state["connected"] = True
     print(f"[Network] Connected and Synced with {addr[0]}!")
 
-    # 3. Send commands from queue loop
+    # 3. Send commands
     while not sync_state["exit"]:
         if sync_state["command_queue"]:
             cmd = sync_state["command_queue"].pop(0)
             try:
                 conn.sendall(cmd.encode())
-            except Exception as e:
-                print(f"[Network Error] {e}")
+            except Exception:
                 break
         time.sleep(0.01)
     
@@ -93,12 +96,13 @@ def client_network_thread(pin):
     # 1. Broadcast UDP to find Host
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    
+
     host_ip = None
     print(f"[Network] Searching for Host with PIN: {pin}...")
-    
+
     while not sync_state["exit"] and not host_ip:
-        udp_sock.sendto(f"DISCOVER:{pin}".encode(), ('<broadcast>', UDP_PORT))
+        # 255.255.255.255 is much more aggressive/reliable for local networks
+        udp_sock.sendto(f"DISCOVER:{pin}".encode(), ('255.255.255.255', UDP_PORT))
         udp_sock.settimeout(2.0)
         try:
             data, addr = udp_sock.recvfrom(1024)
@@ -110,26 +114,24 @@ def client_network_thread(pin):
             continue
 
     udp_sock.close()
+    if sync_state["exit"] or not host_ip: return
 
-    if sync_state["exit"] or not host_ip:
-        return
-
-    # 2. Connect via TCP to receive commands
+    # 2. Connect via TCP
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         tcp_sock.connect((host_ip, TCP_PORT))
-        print("[Network] Connected to Host! Waiting for sync commands...")
+        sync_state["connected"] = True
+        print("[Network] Connected to Host!")
     except Exception as e:
         print(f"[Network Error] {e}")
         return
 
-    # 3. Listen for commands loop
+    # 3. Listen for commands
     while not sync_state["exit"]:
         try:
             data = tcp_sock.recv(1024)
-            if not data:
-                break
-            
+            if not data: break
+
             commands = data.decode().split("|")
             for cmd in commands:
                 if cmd == "PLAY":
@@ -140,70 +142,80 @@ def client_network_thread(pin):
                     sync_state["exit"] = True
                 elif cmd.startswith("SYNC:"):
                     frame = int(cmd.split(":")[1])
-                    sync_state["current_frame"] = frame # Forces jump to frame
-                    
+                    sync_state["current_frame"] = frame
         except Exception:
             break
 
     tcp_sock.close()
 
-# --- VIDEO PLAYER LOGIC ---
-def draw_buttons(frame, is_host):
+# --- MODERN UI DRAWING ---
+def draw_cinematic_ui(frame, is_host):
     h, w = frame.shape[:2]
-    # Button dimensions
-    btn_w, btn_h = 120, 50
-    margin = 20
+    buttons = []
     
-    # Colors (BGR format)
-    bg_color = (40, 40, 40)
-    text_color = (255, 255, 255)
-    
-    # Play/Pause Button
-    play_text = "PAUSE" if sync_state["playing"] else "PLAY"
-    play_x1 = w // 2 - btn_w - margin
-    play_x2 = play_x1 + btn_w
-    play_y1 = h - btn_h - margin
-    play_y2 = h - margin
-    
-    # Exit Button
-    exit_x1 = w // 2 + margin
-    exit_x2 = exit_x1 + btn_w
-    exit_y1 = h - btn_h - margin
-    exit_y2 = h - margin
+    # Auto-hide UI if mouse is not near the bottom (unless paused/disconnected)
+    if mouse_pos["y"] < h - 100 and sync_state["playing"] and sync_state["connected"]:
+        return buttons
 
-    # Draw rectangles and text
-    cv2.rectangle(frame, (play_x1, play_y1), (play_x2, play_y2), bg_color, -1)
-    cv2.rectangle(frame, (exit_x1, exit_y1), (exit_x2, exit_y2), (40, 40, 200), -1)
-    
-    cv2.putText(frame, play_text, (play_x1 + 25, play_y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
-    cv2.putText(frame, "EXIT", (exit_x1 + 35, exit_y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+    # Draw dark semi-transparent gradient bar at the bottom
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, h - 80), (w, h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
 
-    return [(play_x1, play_y1, play_x2, play_y2, "PLAY_PAUSE"), 
-            (exit_x1, exit_y1, exit_x2, exit_y2, "EXIT")]
+    center_x = w // 2
+    btn_y = h - 40
+
+    if is_host:
+        if sync_state["playing"]:
+            # Draw sleek Pause bars
+            cv2.rectangle(frame, (center_x - 12, btn_y - 15), (center_x - 4, btn_y + 15), (255, 255, 255), -1)
+            cv2.rectangle(frame, (center_x + 4, btn_y - 15), (center_x + 12, btn_y + 15), (255, 255, 255), -1)
+        else:
+            # Draw sleek Play triangle
+            pts = np.array([[center_x - 8, btn_y - 16], [center_x - 8, btn_y + 16], [center_x + 16, btn_y]], np.int32)
+            cv2.fillPoly(frame, [pts], (255, 255, 255))
+        
+        buttons.append((center_x - 40, btn_y - 40, center_x + 40, btn_y + 40, "PLAY_PAUSE"))
+
+    # Draw Exit Text
+    cv2.putText(frame, "EXIT", (w - 100, btn_y + 8), cv2.FONT_HERSHEY_DUPLEX, 0.7, (200, 200, 200), 1)
+    buttons.append((w - 120, btn_y - 40, w, h, "EXIT"))
+
+    # Status/Info Text
+    role_text = "HOST" if is_host else "CLIENT"
+    status_color = (100, 255, 100) if sync_state["connected"] else (100, 100, 255)
+    status_text = "SYNCED" if sync_state["connected"] else "WAITING FOR CONNECTION..."
+    
+    cv2.putText(frame, f"{role_text} | PIN: {global_pin}", (30, btn_y + 8), cv2.FONT_HERSHEY_DUPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(frame, status_text, (30, btn_y - 20), cv2.FONT_HERSHEY_DUPLEX, 0.5, status_color, 1)
+
+    return buttons
 
 def handle_mouse(event, x, y, flags, param):
+    mouse_pos["x"] = x
+    mouse_pos["y"] = y
+    
     buttons = param.get("buttons", [])
     is_host = param.get("is_host", False)
 
     if event == cv2.EVENT_LBUTTONDOWN:
         for (x1, y1, x2, y2, action) in buttons:
             if x1 <= x <= x2 and y1 <= y <= y2:
-                if action == "PLAY_PAUSE":
-                    if is_host: # Only host can control playback
-                        new_state = not sync_state["playing"]
-                        sync_state["playing"] = new_state
-                        cmd = "PLAY|" if new_state else "PAUSE|"
-                        sync_state["command_queue"].append(cmd)
-                    else:
-                        print("Only the HOST can control playback.")
+                if action == "PLAY_PAUSE" and is_host:
+                    new_state = not sync_state["playing"]
+                    sync_state["playing"] = new_state
+                    cmd = "PLAY|" if new_state else "PAUSE|"
+                    sync_state["command_queue"].append(cmd)
                 elif action == "EXIT":
                     sync_state["exit"] = True
                     if is_host:
                         sync_state["command_queue"].append("EXIT|")
 
-
+# --- MAIN PLAYER LOGIC ---
 def start_player(video_path, side, role, pin, play_audio):
-    # Start Network Thread
+    global global_pin
+    global_pin = pin
+
     if role == "host":
         net_thread = threading.Thread(target=host_network_thread, args=(pin,))
     else:
@@ -212,82 +224,67 @@ def start_player(video_path, side, role, pin, play_audio):
     net_thread.daemon = True
     net_thread.start()
 
-    # Load Video
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_delay = int(1000 / fps) if fps > 0 else 30
 
-    # Load Audio
     player = MediaPlayer(video_path) if play_audio else None
 
-    # Calculate Crops
-    ret, frame = cap.read()
-    orig_h, orig_w = frame.shape[:2]
+    ret, original_frame = cap.read()
+    orig_h, orig_w = original_frame.shape[:2]
     target_h = int(orig_w * (9 / 32))
     y_start = (orig_h - target_h) // 2
     y_end = y_start + target_h
     half_w = orig_w // 2
 
-    # Setup Window
     window_name = "Ultrawide Sync Player"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    # Sync variables
     last_sync_time = time.time()
-    
-    print("\n>>> Player Started! Waiting for network sync... <<<")
+    current_frame = original_frame
 
     while not sync_state["exit"]:
-        # If client receives a sync command, jump to that frame
-        if role == "client" and cap.get(cv2.CAP_PROP_POS_FRAMES) < sync_state["current_frame"] - 5:
+        # Frame Syncing Jump
+        if role == "client" and sync_state["connected"] and cap.get(cv2.CAP_PROP_POS_FRAMES) < sync_state["current_frame"] - 5:
              cap.set(cv2.CAP_PROP_POS_FRAMES, sync_state["current_frame"])
-             if player:
-                 player.seek(sync_state["current_frame"] / fps)
+             if player: player.seek(sync_state["current_frame"] / fps)
 
-        if sync_state["playing"]:
+        # Video Playback Progression
+        if sync_state["playing"] and sync_state["connected"]:
             ret, frame = cap.read()
-            if not ret:
-                break # Video ended
+            if not ret: break 
+            current_frame = frame
             
-            # Host sends sync ping every 2 seconds to keep Client perfectly matched
             if role == "host" and time.time() - last_sync_time > 2.0:
-                current_f = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                sync_state["command_queue"].append(f"SYNC:{current_f}|")
+                f_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                sync_state["command_queue"].append(f"SYNC:{f_pos}|")
                 last_sync_time = time.time()
-        else:
-            # If paused, keep showing the same frame
-            pass 
-
-        # Process Audio
-        if play_audio and player and sync_state["playing"]:
+        
+        # Audio progression
+        if play_audio and player and sync_state["playing"] and sync_state["connected"]:
             audio_frame, val = player.get_frame()
 
-        # Crop and Split
-        cropped = frame[y_start:y_end, 0:orig_w]
+        # Image Processing & UI
+        cropped = current_frame[y_start:y_end, 0:orig_w]
         display_frame = cropped[:, 0:half_w] if side == "left" else cropped[:, half_w:orig_w]
-        
-        # Add UI Buttons
         display_frame = display_frame.copy()
-        buttons = draw_buttons(display_frame, role == "host")
+        
+        buttons = draw_cinematic_ui(display_frame, role == "host")
         
         cv2.setMouseCallback(window_name, handle_mouse, param={"buttons": buttons, "is_host": role=="host"})
         cv2.imshow(window_name, display_frame)
 
         if cv2.waitKey(frame_delay) & 0xFF == ord('q'):
             sync_state["exit"] = True
-            if role == "host":
-                sync_state["command_queue"].append("EXIT|")
+            if role == "host": sync_state["command_queue"].append("EXIT|")
             break
 
-    # Cleanup
     cap.release()
     cv2.destroyAllWindows()
-    if player:
-        player.close_player()
+    if player: player.close_player()
 
-
-# --- TKINTER LAUNCHER UI ---
+# --- LAUNCHER UI ---
 def run_launcher():
     root = tk.Tk()
     root.title("32:9 Ultrawide Setup")
@@ -298,14 +295,13 @@ def run_launcher():
 
     def select_video():
         path = filedialog.askopenfilename(title="Select Video File", filetypes=[("Video Files", "*.mp4 *.mkv *.avi")])
-        if path:
-            video_path.set(path)
+        if path: video_path.set(path)
 
     def launch(role):
         if not video_path.get():
             messagebox.showerror("Error", "Please select a video file first!")
             return
-            
+
         side = side_var.get()
         audio = audio_var.get()
         pin = pin_entry.get().strip()
@@ -314,20 +310,14 @@ def run_launcher():
             messagebox.showerror("Error", "PIN must be exactly 4 digits.")
             return
 
-        if audio and not FFPYPLAYER_AVAILABLE:
-            messagebox.showerror("Error", "ffpyplayer not installed. Cannot play audio.")
-            return
-
         root.destroy()
         start_player(video_path.get(), side, role, pin, audio)
 
-    # UI Elements
     tk.Label(root, text="Step 1: Select Video", font=("Arial", 12, "bold")).pack(anchor="w")
     tk.Button(root, text="Browse...", command=select_video).pack(fill="x", pady=5)
     tk.Label(root, textvariable=video_path, fg="gray", wraplength=350).pack()
 
     tk.Label(root, text="\nStep 2: Settings", font=("Arial", 12, "bold")).pack(anchor="w")
-    
     side_var = tk.StringVar(value="left")
     tk.Radiobutton(root, text="Left Screen", variable=side_var, value="left").pack(anchor="w")
     tk.Radiobutton(root, text="Right Screen", variable=side_var, value="right").pack(anchor="w")
@@ -336,24 +326,19 @@ def run_launcher():
     tk.Checkbutton(root, text="Play Audio on this laptop", variable=audio_var).pack(anchor="w", pady=10)
 
     tk.Label(root, text="\nStep 3: Network Link", font=("Arial", 12, "bold")).pack(anchor="w")
-    
     pin_frame = tk.Frame(root)
     pin_frame.pack(fill="x", pady=5)
     tk.Label(pin_frame, text="4-Digit Sync PIN:").pack(side="left")
     
-    # Auto-generate a pin
-    random_pin = str(random.randint(1000, 9999))
     pin_entry = tk.Entry(pin_frame, width=10)
-    pin_entry.insert(0, random_pin)
+    pin_entry.insert(0, str(random.randint(1000, 9999)))
     pin_entry.pack(side="left", padx=10)
 
     btn_frame = tk.Frame(root)
     btn_frame.pack(fill="x", pady=20)
-    
-    tk.Button(btn_frame, text="START AS HOST", bg="green", fg="white", font=("Arial", 10, "bold"), 
+    tk.Button(btn_frame, text="START AS HOST", bg="green", fg="white", font=("Arial", 10, "bold"),
               command=lambda: launch("host")).pack(side="left", expand=True, fill="x", padx=5)
-              
-    tk.Button(btn_frame, text="JOIN AS CLIENT", bg="blue", fg="white", font=("Arial", 10, "bold"), 
+    tk.Button(btn_frame, text="JOIN AS CLIENT", bg="blue", fg="white", font=("Arial", 10, "bold"),
               command=lambda: launch("client")).pack(side="left", expand=True, fill="x", padx=5)
 
     root.mainloop()
