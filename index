@@ -1,118 +1,125 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from tkinter import ttk
-import subprocess
-import threading
-import os
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pure CSS Split Screen Video</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden; /* Prevents scrolling */
+            background-color: black;
+            font-family: sans-serif;
+        }
 
-def browse_input():
-    filename = filedialog.askopenfilename(
-        title="Select Input Video",
-        filetypes=(("Video files", "*.mp4 *.mkv *.avi *.mov"), ("All files", "*.*"))
-    )
-    if filename:
-        input_var.set(filename)
+        /* The floating control panel */
+        .controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        }
 
-def browse_output():
-    filename = filedialog.asksaveasfilename(
-        title="Save Output Video As",
-        defaultextension=".mp4",
-        filetypes=(("MP4 Video", "*.mp4"), ("All files", "*.*"))
-    )
-    if filename:
-        output_var.set(filename)
+        input {
+            padding: 8px;
+            margin-right: 5px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
 
-def run_ffmpeg(input_file, output_file, position):
-    if position == "Left":
-        pad_filter = "pad=iw*2:ih:0:0"
-    else:
-        pad_filter = "pad=iw*2:ih:iw:0"
+        button {
+            padding: 8px 12px;
+            margin: 5px 2px;
+            cursor: pointer;
+            border: none;
+            background: #28a745;
+            color: white;
+            border-radius: 4px;
+            font-weight: bold;
+        }
 
-    command = [
-        "ffmpeg",
-        "-i", input_file,
-        "-vf", pad_filter,
-        "-c:a", "copy",
-        "-y",
-        output_file
-    ]
+        button.side-btn {
+            background: #007bff;
+        }
 
-    try:
-        # Run FFmpeg without opening a new console window (specifically for Windows)
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        button:hover { opacity: 0.8; }
 
-        subprocess.run(command, check=True, startupinfo=startupinfo)
-        
-        # Update UI safely from thread
-        root.after(0, lambda: messagebox.showinfo("Success", f"Video successfully saved to:\n{output_file}"))
-    except subprocess.CalledProcessError as e:
-        root.after(0, lambda: messagebox.showerror("Error", f"An error occurred during conversion.\nCheck if FFmpeg is installed."))
-    except FileNotFoundError:
-        root.after(0, lambda: messagebox.showerror("Error", "FFmpeg not found! Please ensure it is installed and added to your system PATH."))
-    finally:
-        # Reset UI
-        root.after(0, reset_ui)
+        /* --- THE CSS SPLIT MAGIC --- */
 
-def start_conversion():
-    input_file = input_var.get()
-    output_file = output_var.get()
-    position = side_var.get()
+        /* 1. The wrapper strictly limits what you see to 1 screen width */
+        .video-wrapper {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+        }
 
-    if not input_file or not output_file:
-        messagebox.showwarning("Missing Files", "Please select both an input and output file.")
-        return
+        /* 2. The video is forced to be 200% wide */
+        iframe {
+            position: absolute;
+            top: 0;
+            width: 200vw;
+            height: 100vh;
+            border: none;
+            transition: left 0.4s ease-in-out; /* Smooth sliding animation */
+        }
 
-    # Disable buttons and show progress text
-    convert_btn.config(state=tk.DISABLED)
-    status_var.set("Status: Converting... Please wait.")
-    
-    # Run the conversion in a separate thread so the GUI doesn't freeze
-    thread = threading.Thread(target=run_ffmpeg, args=(input_file, output_file, position))
-    thread.daemon = True
-    thread.start()
+        /* 3. Left side keeps it at coordinate 0 */
+        .left-side iframe {
+            left: 0;
+        }
 
-def reset_ui():
-    convert_btn.config(state=tk.NORMAL)
-    status_var.set("Status: Ready")
+        /* 4. Right side shifts the whole 200% video left by exactly 1 screen width */
+        .right-side iframe {
+            left: -100vw;
+        }
+    </style>
+</head>
+<body>
 
-# --- GUI Setup ---
-root = tk.Tk()
-root.title("16:9 to 32:9 Video Converter")
-root.geometry("500x250")
-root.resizable(False, False)
+    <div class="controls" id="control-panel">
+        <input type="text" id="video-id" value="dQw4w9WgXcQ" placeholder="YouTube Video ID">
+        <button onclick="loadVideo()">Load Custom Video</button>
+        <hr style="border: 0; border-top: 1px solid #ccc; margin: 10px 0;">
+        <button class="side-btn" onclick="setScreen('left')">Make this Left Laptop</button>
+        <button class="side-btn" onclick="setScreen('right')">Make this Right Laptop</button>
+        <button onclick="hideControls()" style="background:#dc3545;">Hide Controls</button>
+    </div>
 
-# Variables
-input_var = tk.StringVar()
-output_var = tk.StringVar()
-side_var = tk.StringVar(value="Left")
-status_var = tk.StringVar(value="Status: Ready")
+    <div class="video-wrapper left-side" id="wrapper">
+        <iframe id="yt-player" src="https://www.youtube.com/embed/dQw4w9WgXcQ" allowfullscreen></iframe>
+    </div>
 
-# Styling
-padding_opts = {'padx': 10, 'pady': 5}
+    <script>
+        // Changes the CSS class to shift the video left or right
+        function setScreen(side) {
+            const wrapper = document.getElementById('wrapper');
+            if (side === 'left') {
+                wrapper.className = 'video-wrapper left-side';
+            } else {
+                wrapper.className = 'video-wrapper right-side';
+            }
+        }
 
-# Input Row
-tk.Label(root, text="Input Video:").grid(row=0, column=0, sticky="w", **padding_opts)
-tk.Entry(root, textvariable=input_var, width=40, state="readonly").grid(row=0, column=1, **padding_opts)
-tk.Button(root, text="Browse", command=browse_input).grid(row=0, column=2, **padding_opts)
+        // Loads a new YouTube video based on the ID in the input box
+        function loadVideo() {
+            const vidId = document.getElementById('video-id').value;
+            const player = document.getElementById('yt-player');
+            player.src = `https://www.youtube.com/embed/${vidId}`;
+        }
 
-# Output Row
-tk.Label(root, text="Output Video:").grid(row=1, column=0, sticky="w", **padding_opts)
-tk.Entry(root, textvariable=output_var, width=40, state="readonly").grid(row=1, column=1, **padding_opts)
-tk.Button(root, text="Browse", command=browse_output).grid(row=1, column=2, **padding_opts)
+        // Hides the white control panel so the screen is completely black/video
+        function hideControls() {
+            document.getElementById('control-panel').style.display = 'none';
+        }
+    </script>
 
-# Side Selection Row
-tk.Label(root, text="Keep Video On:").grid(row=2, column=0, sticky="w", **padding_opts)
-side_dropdown = ttk.Combobox(root, textvariable=side_var, values=["Left", "Right"], state="readonly", width=15)
-side_dropdown.grid(row=2, column=1, sticky="w", **padding_opts)
-
-# Status Label
-tk.Label(root, textvariable=status_var, fg="blue").grid(row=3, column=0, columnspan=3, pady=(15, 5))
-
-# Convert Button
-convert_btn = tk.Button(root, text="Convert Video", command=start_conversion, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), width=15)
-convert_btn.grid(row=4, column=0, columnspan=3, pady=10)
-
-root.mainloop()
+</body>
+</html>
